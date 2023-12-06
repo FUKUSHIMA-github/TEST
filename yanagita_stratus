@@ -1,0 +1,578 @@
+#include<stdio.h>
+#include<stdlib.h>
+#include<string.h>
+#include<math.h>
+#include "mt64.h"
+
+#define Nx 80 /*Stratus 0.3km~0.6km*/
+#define Ny 40
+#define N Nx*Ny
+#define lambda 0.20 /*拡散係数 λ*/
+#define eta 0.20 /*粘性係数 η*/
+#define nu 0.20 /*非圧縮効果 ν*/
+#define c 0.20 /*浮力の定数*/
+#define beta 0.20 /*断熱膨張 β*/
+#define Vg 0.20 /*液滴落下速度 Vg*/
+#define gamma 0.20 /*引きずり抵抗 γ*/
+#define alpha 0.20 /*転移速度 α*/
+#define Q 0.20 /*潜熱 Q*/
+#define E_0 3.0 /*底面の固定エネルギー*/
+
+void BuoyancyAndDraggingForce();
+void ViscosityAndPressureEffect();
+void DiffusionOfVapor();
+void ThermalDiffusionAndAdiabaticExpansion();
+void PhaseTransition();
+void Advection();
+void BoundaryConditon();
+
+double vx[Nx][Ny];/*水平方向速度*/
+double vy[Nx][Ny]; /*鉛直方向速度*/
+double temvy[Nx][Ny];/*時間更新せずに用いるため*/
+double T[Nx][Ny];/*温度*/
+double E[Nx][Ny];/*内部エネルギー*/
+double wv[Nx][Ny]; /*蒸気量*/
+double wl[Nx][Ny]; /*液滴量*/
+double W[Nx][Ny];/*水滴総量*/ 
+double wmax[Nx][Ny]; /*飽和水蒸気密度*/
+
+FILE *fout;
+
+int main(){
+ int step,i,j;
+ 
+ unsigned long long init[4]={74565ULL, 144470ULL, 214375ULL, 284280ULL}, length=4;
+ unsigned long long init_seed = 525ULL; 
+ unsigned long long i_tmp;
+
+ fout = fopen("stratus0000.d","w");
+ 
+ init_by_array64(init, length);  /*配列で初期化*/
+ for(i=0; i<Nx*Ny; i++) {i_tmp = genrand64_int64(); /*[0, 2^64-1]範囲の整数乱数を生成*/}
+ 
+  /*速度の初期条件*/
+ for(i=0;i<Nx;i++){
+  for(j=0;j<Ny;j++){
+   vx[i][j] = (2.0*genrand64_real1() - 1.0)/100; /*ノイズとしてゆらぎを与える*/
+   vy[i][j] = (2.0*genrand64_real2() - 1.0)/100; /*ノイズとしてゆらぎを与える*/
+  }
+ } 
+   
+ /*蒸気量と液滴量の初期条件*/
+ for(i=0;i<Nx;i++){
+  for(j=0;j<Ny;j++){
+   if(j==0||j==Ny-1){
+    wv[i][j] = 0.00; 
+    wl[i][j] = 0.00; /*液適量と蒸気量は上底面で０に固定する。*/
+   }else if(j==1||j==2||j==3||j==4||j==5||j==6||j==7){ 
+    wv[i][j] = 0.006/Nx*7; 
+    wl[i][j] = 0.00; 
+   }else{
+    wv[i][j] = genrand64_real1()/100000000;
+    wl[i][j] = 0.0; 
+   }
+  }
+ }
+ 
+ /*内部エネルギーと温度の初期条件*/
+ double deltaT = (E_0-(-E_0))/(Ny-1);  /*温度勾配*/
+ for(i=0;i<Nx;i++){
+  for(j=0;j<Ny;j++){
+   E[i][j] = E_0 -j*deltaT + genrand64_real3()/10;
+   T[i][j] = 300-0.065*j;/*ケルビン温度  減少を考慮*/
+   wmax[i][j] = 217.0*exp(19.482-(4303.4/(T[i][j]-29.5)))/T[i][j];/*飽和水蒸気密度の理論式*/
+  }
+ }
+ 
+
+ for(i=0;i<Nx;i++){
+  for(j=0;j<Ny;j++){
+   fprintf(fout, "%d %d %.10lf %.10lf %.10lf %.10lf %.10lf\n",i, j, wl[i][j],wv[i][j],vx[i][j],vy[i][j],E[i][j]);
+  }
+  fprintf(fout,"\n");
+ }
+ 
+ 
+ fclose(fout);
+  
+char outfile1[20],file_top1[8]="stratus",tmp1[6]= "0000",type[3]= ".d";
+ 
+ for(step=1;step<401;step++){ 
+ 
+  for(i=0;i<Nx;i++){
+   for(j=0;j<Ny;j++){
+    temvy[i][j] = vy[i][j];
+   }
+  } 
+      
+  BuoyancyAndDraggingForce();/*step1 浮力+ひきづりを適用し、vx,vyを更新*/
+   for(i=0;i<Nx;i++){
+    for(j=0;j<Ny;j++){
+     if(wl[i][j]<0.0||wv[i][j]<0.0){
+      printf("Error at step %d: Negative values in wl or wv on Buoyancy\n",step);
+      exit(EXIT_FAILURE);
+     }
+    }
+   }
+  ViscosityAndPressureEffect(); /*step2 粘性+非圧縮を適用し、vx,vyを更新*/ 
+   for(i=0;i<Nx;i++){
+    for(j=0;j<Ny;j++){
+     if(wl[i][j]<0.0||wv[i][j]<0.0){
+      printf("Errorat step %d: Negative values in wl or wv on Viscosity\n",step);
+      exit(EXIT_FAILURE);
+     }
+    }
+   }  
+  ThermalDiffusionAndAdiabaticExpansion(); /*step3 拡散+熱拡散+膨張を適用し、E,wv,wlを更新*/
+  DiffusionOfVapor();
+   for(i=0;i<Nx;i++){
+    for(j=0;j<Ny;j++){
+     if(wl[i][j]<0.0||wv[i][j]<0.0){
+      printf("Error at step %d: Negative values in wl or wv on diffusion\n",step);
+      exit(EXIT_FAILURE);
+     }
+    }
+   }    
+  PhaseTransition();/*step4 相転移を適用し、E,wv,wlを更新*/ 
+   for(i=0;i<Nx;i++){
+    for(j=0;j<Ny;j++){
+     if(wl[i][j]<0.0){
+      wl[i][j] = 0.0;
+     }
+    }
+   } 
+   for(i=0;i<Nx;i++){
+    for(j=0;j<Ny;j++){
+     if(wv[i][j]<0.0){
+       wv[i][j] = 0.0;
+     }
+    }
+   }           
+  Advection();/*step5 移流+重力を適用し、vx,vy,T,wv,wlを更新*/
+   for(i=0;i<Nx;i++){
+    for(j=0;j<Ny;j++){
+     if(wl[i][j]<0.0||wv[i][j]<0.0){
+      printf("Error at step %d: Negative values in wl or wv on Advection\n",step);
+      exit(EXIT_FAILURE);
+     }
+    }
+   }
+   
+   strcpy(outfile1,file_top1);
+   sprintf(tmp1,"%04d",step);
+   strcat(outfile1,tmp1);
+   strcat(outfile1,type);
+   fout = fopen(outfile1, "w"); 
+    for(i=0;i<Nx;i++){
+     for(j=0;j<Ny;j++){  
+      fprintf(fout, "%d %d %.10lf %.10lf %.10lf %.10lf %.10lf\n",i, j, wl[i][j],wv[i][j],vx[i][j],vy[i][j],E[i][j]);
+     }
+    fprintf(fout,"\n");
+    } 
+  fclose(fout); 
+ }
+ 
+  for(step=401;step<5001;step++){ 
+ 
+  for(i=0;i<Nx;i++){
+   for(j=0;j<Ny;j++){
+    temvy[i][j] = vy[i][j];
+   }
+  } 
+      
+  BuoyancyAndDraggingForce();/*step1 浮力+ひきづりを適用し、vx,vyを更新*/
+   for(i=0;i<Nx;i++){
+    for(j=0;j<Ny;j++){
+     if(wl[i][j]<0.0||wv[i][j]<0.0){
+      printf("Error at step %d: Negative values in wl or wv on Buoyancy\n",step);
+      exit(EXIT_FAILURE);
+     }
+    }
+   }
+  ViscosityAndPressureEffect(); /*step2 粘性+非圧縮を適用し、vx,vyを更新*/ 
+   for(i=0;i<Nx;i++){
+    for(j=0;j<Ny;j++){
+     if(wl[i][j]<0.0||wv[i][j]<0.0){
+      printf("Errorat step %d: Negative values in wl or wv on Viscosity\n",step);
+      exit(EXIT_FAILURE);
+     }
+    }
+   }  
+  ThermalDiffusionAndAdiabaticExpansion(); /*step3 拡散+熱拡散+膨張を適用し、E,wv,wlを更新*/
+  DiffusionOfVapor();
+   for(i=0;i<Nx;i++){
+    for(j=0;j<Ny;j++){
+     if(wl[i][j]<0.0||wv[i][j]<0.0){
+      printf("Error at step %d: Negative values in wl or wv on diffusion\n",step);
+      exit(EXIT_FAILURE);
+     }
+    }
+   }    
+  PhaseTransition();/*step4 相転移を適用し、E,wv,wlを更新*/ 
+   for(i=0;i<Nx;i++){
+    for(j=0;j<Ny;j++){
+     if(wl[i][j]<0.0||wv[i][j]<0.0){
+      printf("Error at step %d: Negative values in wl or wv on PhaseTransition\n",step);
+      exit(EXIT_FAILURE);
+     }
+    }
+   }         
+  Advection();/*step5 移流+重力を適用し、vx,vy,T,wv,wlを更新*/
+   for(i=0;i<Nx;i++){
+    for(j=0;j<Ny;j++){
+     if(wl[i][j]<0.0||wv[i][j]<0.0){
+      printf("Error at step %d: Negative values in wl or wv on Advection\n",step);
+      exit(EXIT_FAILURE);
+     }
+    }
+   }
+   
+   if(step%20==0){
+   strcpy(outfile1,file_top1);
+   sprintf(tmp1,"%04d",step);
+   strcat(outfile1,tmp1);
+   strcat(outfile1,type);
+   fout = fopen(outfile1, "w"); 
+    for(i=0;i<Nx;i++){
+     for(j=0;j<Ny;j++){  
+      fprintf(fout, "%d %d %.10lf %.10lf %.10lf %.10lf %.10lf\n",i, j, wl[i][j],wv[i][j],vx[i][j],vy[i][j],E[i][j]);
+     }
+    fprintf(fout,"\n");
+    } 
+  fclose(fout); 
+ }
+}
+ 
+ return 0;
+}
+
+
+void BuoyancyAndDraggingForce(){  /*浮力(周りの空気より温度が高いとサイトが上昇する)＋ひきづり効果*/
+ int i,j;
+ 
+ BoundaryConditon();
+  
+ for(i=0;i<Nx;i++){
+  for(j=1;j<Ny-1;j++){
+     vx[i][j] = vx[i][j];
+     vy[i][j] = vy[i][j] + (c/2.0)*(2.0*E[i][j] - E[(i+1)%Nx][j] - E[(i-1+Nx)%Nx][j]) - gamma*wl[i][j]*(vy[i][j]-Vg);    
+  }
+ } 
+ 
+}
+ 
+void ViscosityAndPressureEffect(){  /*粘性は離散化されたラプラス演算子、非圧縮効果を表現するため、∇(∇・v)を離散化したダイナミクス*/
+ int i,j;
+ double laplacian_vx,laplacian_vy,grad_div_vx,grad_div_vy; 
+ 
+ BoundaryConditon();
+ 
+ for(i=0;i<Nx;i++){
+  for(j=1;j<Ny-1;j++){
+   laplacian_vx = (vx[(i+1)%Nx][j] + vx[i][j+1] + vx[(i-1+Nx)%Nx][j] + vx[i][j-1] - 4.0*vx[i][j])*(1.0/4.0); /*△v(x,y)の計算*/
+   laplacian_vy = (vy[(i+1)%Nx][j] + vy[i][j+1] + vy[(i-1+Nx)%Nx][j] + vy[i][j-1] - 4.0*vy[i][j])*(1.0/4.0); /*△v(x,y)の計算*/
+   grad_div_vx  = (1.0/2.0)*(vx[(i+1)%Nx][j] + vx[(i-1+Nx)%Nx][j]) - vx[i][j] + (1.0/4.0)*(vy[(i+1)%Nx][j+1] + vy[(i-1+Nx)%Nx][j-1] - vy[(i+1)%Nx][j-1] - vy[(i-1+Nx)%Nx][j+1]);/*∇(∇・v(x,y))の計算*/
+   grad_div_vy  = (1.0/2.0)*(vy[(i+1)%Nx][j] + vy[(i-1+Nx)%Nx][j]) - vy[i][j] + (1.0/4.0)*(vx[(i+1)%Nx][j+1] + vx[(i-1+Nx)%Nx][j-1] - vx[(i+1)%Nx][j-1] - vx[(i-1+Nx)%Nx][j+1]);/*∇(∇・v(x,y))の計算*/
+    
+   vx[i][j] =  vx[i][j] + nu*laplacian_vx + eta*grad_div_vx;
+   vy[i][j] =  vy[i][j] + nu*laplacian_vy + eta*grad_div_vy;
+  }
+ }
+   
+}
+
+
+void ThermalDiffusionAndAdiabaticExpansion(){  /*熱拡散＋断熱膨張*/
+ int i,j;
+ double laplacian_E;
+ 
+ BoundaryConditon();
+ 
+ for(i=0;i<Nx;i++){
+  for(j=1;j<Ny-1;j++){
+   laplacian_E = (E[(i+1)%Nx][j] + E[i][j+1] + E[(i-1+Nx)%Nx][j] + E[i][j-1] - 4.0*E[i][j])*(1.0/4.0); /*△T(x,y)の計算*/   
+   E[i][j] =  E[i][j] + lambda*laplacian_E - beta*temvy[i][j];
+  }
+ }
+ 
+}
+
+
+void DiffusionOfVapor(){  /*拡散*/
+ int i,j;
+ double laplacian_wv;
+ 
+ BoundaryConditon();
+  
+ for(i=0;i<Nx;i++){
+  for(j=1;j<Ny-1;j++){
+   laplacian_wv = (wv[(i+1)%Nx][j] + wv[i][j+1] + wv[(i-1+Nx)%Nx][j] + wv[i][j-1] - 4.0*wv[i][j])*(1.0/4.0); /*△wv(x,y)の計算*/
+   wv[i][j] =  wv[i][j] + lambda*laplacian_wv;
+  }
+ }
+    
+}
+
+void PhaseTransition(){ /*相転移*/
+ int i,j;
+ 
+ BoundaryConditon();
+ 
+ for(i=0;i<Nx;i++){
+  for(j=1;j<Ny-1;j++){
+    
+  if(wmax[i][j] > wv[i][j] + wl[i][j]){ /*パーセルの水量が未飽和状態→蒸発が起こる*/
+   wmax[i][j] = (217.0/T[i][j])*exp(19.482-(4303.4/(T[i][j]-29.5)))/100;
+   wl[i][j] = wl[i][j] + alpha*(wv[i][j] - wmax[i][j]); /*液滴量が減少*/
+   wv[i][j] = wv[i][j] - alpha*(wv[i][j] - wmax[i][j]); /*水蒸気量が増加*/
+   E[i][j] = E[i][j] + Q*alpha*(wv[i][j] - wmax[i][j]); /*液体→気体より潜熱吸収が起こる*/  
+   }else{ /*パーセルの水量が飽和状態→凝縮が起こる*/
+   wmax[i][j] = wl[i][j] + wv[i][j];
+   wl[i][j] = wl[i][j] + alpha*(wv[i][j] - wmax[i][j]); /*液滴量が減少*/   
+   wv[i][j] = wv[i][j] - alpha*(wv[i][j] - wmax[i][j]); /*蒸気量が増加*/
+   E[i][j] = E[i][j] + Q*alpha*(wv[i][j] - wmax[i][j]); /*液体→気体により潜熱吸収が起こる*/
+   }
+
+   
+  }
+ }
+ 
+}
+
+
+void Advection(){ /*移流*/
+ int i,j,p;
+ int nearestI,nearestJ;
+ double dx,dy; /*若い近接格子点との距離*/
+ double weight00,weight01,weight10,weight11; /*重み*/
+ double tmpvx[Nx][Ny],tmpvy[Nx][Ny],tmpE[Nx][Ny],tmpwv[Nx][Ny],tmpwl[Nx][Ny]; /*一時的な配列を用意*/
+ double P[N][2]; /* 粒子の位置 */
+ double V[N][2]; /* 粒子の速度 */
+ double E[N][1]; /*粒子のエネルギー*/
+ double WV[N][1]; /*粒子の蒸気量*/
+ double WL[N][1]; /*粒子の液適量*/ 
+  
+ /*一時的な配列の初期化*/
+ for(i=0;i<Nx;i++){
+  for(j=0;j<Ny;j++){
+   tmpvx[i][j] = 0.0;
+   tmpvy[i][j] = 0.0;
+   tmpE[i][j] = 0.0;
+   tmpwv[i][j] = 0.0;
+   tmpwl[i][j] = 0.0;      
+  }
+ }
+ 
+ 
+/*--------------------------------------------液適量以外の移流を実行--------------------------------------------------*/
+ int particle = 0;
+ for(i=0;i<Nx;i++){
+  for(j=0;j<Ny;j++){
+   P[particle][0] = 0.0;
+   P[particle][1] = 0.0;
+   V[particle][0] = 0.0;
+   V[particle][1] = 0.0;
+   E[particle][0] = 0.0;
+   WV[particle][0] = 0.0;     
+   particle++;
+  }
+ }
+ 
+ /* 粒子の配置と速度の設定 */
+ int particleCount = 0;
+ for(i=0;i<Nx;i++){
+  for(j=0;j<Ny;j++){
+   P[particleCount][0] = i;/* x座標をiとする*/
+   P[particleCount][1] = j;/* y座標をjとする*/
+   V[particleCount][0] = vx[i][j];
+   V[particleCount][1] = vy[i][j];
+   E[particleCount][0] = E[i][j];
+   WV[particleCount][0] = wv[i][j];
+   particleCount++;
+  }
+ }
+
+  /*粒子の移動*/
+ for(i=0;i<N;i++){
+  P[i][0] = P[i][0] + V[i][0];
+  P[i][1] = P[i][1] + V[i][1];
+
+ /*周期境界条件（水平方向)*/
+  if(P[i][0]<0){
+   P[i][0] = P[i][0] + Nx;
+  }else if(P[i][0]>(Nx-1)){
+   P[i][0] = P[i][0] - Nx;
+  }
+
+  /* 反射条件（垂直方向)*/
+  if(P[i][1]<0){
+   P[i][1] = -P[i][1];
+   V[i][1] = -V[i][1];
+  }else if(P[i][1]>(Ny-1)){
+   P[i][1] = 2.0*(Ny-1.0) - P[i][1];
+   V[i][1] = -V[i][1];
+  }
+ }
+
+ /*粒子の４つの近接格子点のうち左下の格子点 (i, j) との距離(dx, dy)を計算*/
+  for(p=0;p<N;p++){
+  
+   if(-1.0<P[p][0] && P[p][0]<0.0){
+    nearestI = Nx-1;
+    dx = (int)(P[p][0]+1.0); 
+    if(dx<0.0||dx>1.0){printf("Error 1");}
+   }else if((Nx-1.0)<P[p][0] && P[p][0]<Nx){ 
+    nearestI = Nx-1;
+    dx = P[p][0] - (int)(Nx-1.0);
+    if(dx<0.0||dx>1.0){printf("Error 2");}
+   }else if(0.0<=P[p][0] && P[p][0]<=Nx-1.0){
+    nearestI = (int)P[p][0];
+    dx = P[p][0] - (double)nearestI; 
+    if(dx<0.0||dx>1.0){printf("Error 3");}
+   }
+    
+   nearestJ = (int)P[p][1];
+   dy = P[p][1] - nearestJ;
+       
+
+   weight00 = (1.0-dx)*(1.0-dy);
+   weight01 = dx*(1.0-dy);
+   weight10 = (1.0-dx)*dy;
+   weight11 = dx*dy;
+    
+   tmpvx[nearestI][nearestJ] += weight00*V[p][0];
+   tmpvx[(nearestI+1)%Nx][nearestJ] += weight01*V[p][0];
+   tmpvx[nearestI][nearestJ+1] += weight10*V[p][0];
+   tmpvx[(nearestI+1)%Nx][nearestJ+1] += weight11*V[p][0];
+
+   tmpvy[nearestI][nearestJ] += weight00*V[p][1];
+   tmpvy[(nearestI+1)%Nx][nearestJ] += weight01*V[p][1];
+   tmpvy[nearestI][nearestJ+1] += weight10*V[p][1];
+   tmpvy[(nearestI+1)%Nx][nearestJ+1] += weight11*V[p][1];
+
+   tmpE[nearestI][nearestJ] += weight00*E[p][0];
+   tmpE[(nearestI+1)%Nx][nearestJ] += weight01*E[p][0];
+   tmpE[nearestI][nearestJ+1] += weight10*E[p][0];
+   tmpE[(nearestI+1)%Nx][nearestJ+1] += weight11*E[p][0];
+   
+   tmpwv[nearestI][nearestJ] += weight00*WV[p][0];
+   tmpwv[(nearestI+1)%Nx][nearestJ] += weight01*WV[p][0];
+   tmpwv[nearestI][nearestJ+1] += weight10*WV[p][0];
+   tmpwv[(nearestI+1)%Nx][nearestJ+1] += weight11*WV[p][0];
+  }
+  
+ /*------------------------液滴量の移流に関して、vy[i][j]→vy[i][j]-Vgとして移流を実行する---------------------------------*/ 
+ double P_WL[N][2]; /* 粒子の位置 */
+ double V_WL[N][2]; /* 粒子の速度 */
+ 
+ int particle_WL = 0;
+ for(i=0;i<Nx;i++){
+  for(j=0;j<Ny;j++){
+   P_WL[particle_WL][0] = 0.0;
+   P_WL[particle_WL][1] = 0.0;
+   V_WL[particle_WL][0] = 0.0;
+   V_WL[particle_WL][1] = 0.0;
+   WL[particle_WL][0] = 0.0;      
+   particle_WL++;
+  }
+ }
+ 
+ /* 粒子の配置と速度の設定 */
+ int particleCount_WL = 0;
+ for(i=0;i<Nx;i++){
+  for(j=0;j<Ny;j++){
+   P_WL[particleCount_WL][0] = i;/* x座標をiとする*/
+   P_WL[particleCount_WL][1] = j;/* y座標をjとする*/
+   V_WL[particleCount_WL][0] = vx[i][j];
+   V_WL[particleCount_WL][1] = vy[i][j] - Vg;
+   WL[particleCount_WL][0] = wl[i][j];  
+   particleCount_WL++;
+  }
+ }
+
+  /*粒子の移動*/
+ for(i=0;i<N;i++){
+  P_WL[i][0] = P_WL[i][0] + V_WL[i][0];
+  P_WL[i][1] = P_WL[i][1] + V_WL[i][1];
+
+ /*周期境界条件（水平方向)*/
+  if(P_WL[i][0]<0){
+   P_WL[i][0] = P_WL[i][0] + Nx;
+  }else if(P_WL[i][0]>(Nx-1)){
+   P_WL[i][0] = P_WL[i][0] - Nx;
+  }
+
+  /* 反射条件（垂直方向)*/
+  if(P_WL[i][1]<0){
+   P_WL[i][1] = -P_WL[i][1];
+   V_WL[i][1] = -V_WL[i][1];
+  }else if(P_WL[i][1]>(Ny-1)){
+   P_WL[i][1] = 2.0*(Ny-1.0) - P_WL[i][1];
+   V_WL[i][1] = -V_WL[i][1];
+  }
+ }
+
+ /*粒子の４つの近接格子点のうち左下の格子点 (i, j) との距離(dx, dy)を計算*/
+  for(p=0;p<N;p++){
+  
+   if(-1.0<P_WL[p][0] && P_WL[p][0]<0.0){
+    nearestI = Nx-1;
+    dx = (int)(P_WL[p][0]+1.0); 
+    if(dx<0.0||dx>1.0){printf("Error 1");}
+   }else if((Nx-1.0)<P_WL[p][0] && P_WL[p][0]<Nx){ 
+    nearestI = Nx-1;
+    dx = P_WL[p][0] - (int)(Nx-1.0);
+    if(dx<0.0||dx>1.0){printf("Error 2");}
+   }else if(0.0<=P_WL[p][0] && P_WL[p][0]<=Nx-1.0){
+    nearestI = (int)P_WL[p][0];
+    dx = P_WL[p][0] - (double)nearestI; 
+    if(dx<0.0||dx>1.0){printf("Error 3");}
+   }
+    
+   nearestJ = (int)P_WL[p][1];
+   dy = P_WL[p][1] - nearestJ;
+       
+
+   weight00 = (1.0-dx)*(1.0-dy);
+   weight01 = dx*(1.0-dy);
+   weight10 = (1.0-dx)*dy;
+   weight11 = dx*dy;
+      
+   tmpwl[nearestI][nearestJ] += weight00*WL[p][0];
+   tmpwl[(nearestI+1)%Nx][nearestJ] += weight01*WL[p][0];
+   tmpwl[nearestI][nearestJ+1] += weight10*WL[p][0];
+   tmpwl[(nearestI+1)%Nx][nearestJ+1] += weight11*WL[p][0];
+  }
+  
+ /*移流後の情報量を更新*/
+ for(i=0;i<Nx;i++){
+  for(j=0;j<Ny;j++){
+   vx[i][j] = tmpvx[i][j];
+   vy[i][j] = tmpvy[i][j];
+   E[i][j] = tmpE[i][j];
+   wv[i][j] = tmpwv[i][j];
+   wl[i][j] = tmpwl[i][j];
+  }
+ }
+ 
+ 
+}
+
+
+void BoundaryConditon(){
+ int i;
+ for(i=0;i<Nx;i++){
+  /*内部エネルギー*/
+  E[i][0] = E_0; /*固定条件*/
+  E[i][Ny-1] = E[i][Ny-2];/*ノイマン条件*/
+ /*速度(固定境界)*/
+  vx[i][0] = 2.0*genrand64_real1(); 
+  vy[i][0] = 0.30; 
+  vx[i][Ny-1] = -2.0*genrand64_real2();  
+  /*蒸気量と液適量(固定境界)*/
+  wv[i][0] = 0.0;
+  wv[i][Ny-1] = 0.0;
+  wl[i][0] = 0.0;
+  wl[i][Ny-1] = 0.0; 
+ }
+} 
